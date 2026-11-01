@@ -42,6 +42,10 @@ CREATE TABLE IF NOT EXISTS product_offers (
   last_queued_at TIMESTAMPTZ,
   last_observed_at TIMESTAMPTZ,
   last_price NUMERIC(14, 2),
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  last_failure_at TIMESTAMPTZ,
+  last_failure_alerted_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (product_id, url)

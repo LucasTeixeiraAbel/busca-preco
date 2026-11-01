@@ -1,0 +1,5 @@
+ALTER TABLE product_offers
+  ADD COLUMN IF NOT EXISTS consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS last_error TEXT,
+  ADD COLUMN IF NOT EXISTS last_failure_at TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS last_failure_alerted_at TIMESTAMPTZ;

@@ -2,6 +2,7 @@ import pytest
 import asyncio
 import jwt
 import hashlib
+from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi.security import HTTPAuthorizationCredentials
 
@@ -393,9 +394,29 @@ def test_parses_product_json_ld_and_brazilian_price_format():
 
 
 def test_parses_amazon_active_offer_price_not_struck_through_price():
-    html = '''<span class="a-price"><span class="a-offscreen">R$ 4.749,90</span></span>
+    html = '''<div id="corePrice_feature_div"><span class="a-price"><span class="a-offscreen">R$ 4.749,90</span></span>
     <span class="a-price a-text-price"><span class="a-offscreen">R$ 5.999,90</span></span>'''
-    assert parse_price(html) == 4749.90
+    html += "</div>"
+    assert parse_price(html, "Amazon") == 4749.90
+
+
+def test_amazon_fixture_ignores_accessory_struck_through_and_installment_prices():
+    html = (Path(__file__).parent / "fixtures" / "amazon-product.html").read_text(encoding="utf-8")
+    assert 'id="corePrice_feature_div"' in html
+    assert parse_price(html, "Amazon") == 4369.90
+
+
+def test_amazon_without_scoped_price_uses_json_ld_not_global_metadata_or_prices():
+    html = '''<meta itemprop="price" content="349.90">
+    <span class="a-price"><span class="a-offscreen">R$ 349,90</span></span>
+    <script type="application/ld+json">{"@type":"Product","offers":{"price":"4299.90","priceCurrency":"BRL"}}</script>'''
+    assert parse_price(html, "Amazon") == 4299.90
+
+
+def test_amazon_without_scoped_or_json_ld_price_fails_closed():
+    html = '<meta itemprop="price" content="349.90"><span class="a-price"><span class="a-offscreen">R$ 349,90</span></span>'
+    with pytest.raises(ValueError, match="Preço estruturado"):
+        parse_price(html, "Amazon")
 
 
 def test_rejects_missing_or_invalid_structured_price():
