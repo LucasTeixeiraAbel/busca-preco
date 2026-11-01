@@ -19,6 +19,17 @@ log = logging.getLogger("price-scraper")
 JOBS, GROUP, CONSUMER = "scrape:jobs", "scrapers", os.getenv("SCRAPER_ID", "scraper-1")
 
 
+async def guard_navigation(route: object) -> None:
+    request = route.request
+    if request.is_navigation_request() and request.resource_type == "document":
+        try:
+            validate_store_url(request.url)
+        except ValueError:
+            await route.abort()
+            return
+    await route.continue_()
+
+
 def parse_price(html: str) -> float:
     soup = BeautifulSoup(html, "html.parser")
     def numeric_price(raw: object) -> float | None:
@@ -104,6 +115,7 @@ async def run() -> None:
                                 url = validate_store_url(job["url"])
                                 page = await browser.new_page()
                                 try:
+                                    await page.route("**/*", guard_navigation)
                                     response = await page.goto(url, wait_until="domcontentloaded", timeout=15000)
                                     if not response or response.status >= 400:
                                         raise ValueError("Loja retornou resposta HTTP inválida")

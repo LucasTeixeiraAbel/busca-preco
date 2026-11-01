@@ -19,8 +19,7 @@ Para instalar o catálogo em um volume existente, aplique também `backend/migra
 
 ## Endpoints
 
-- `POST /observations`: recebe observação e a coloca em `price:observations`.
-- `POST /scrape`: agenda uma coleta avulsa em `scrape:jobs`, com `{"product_id":"ssd-1tb-kabum","url":"https://www.kabum.com.br/produto/ID"}`. Não precisa enviar preço nem nome de loja; o rótulo é derivado do domínio autorizado. Resposta `202` confirma apenas o enfileiramento.
+- `POST /scrape`: agenda uma coleta avulsa autenticada com Authorization: Bearer ALERT_ADMIN_TOKEN em `scrape:jobs`, com `{"product_id":"ssd-1tb-kabum","url":"https://www.kabum.com.br/produto/ID"}`. Não precisa enviar preço nem nome de loja; o rótulo é derivado do domínio autorizado. Resposta `202` confirma apenas o enfileiramento.
 - `POST /admin/products`: cadastra/atualiza um anúncio para monitoramento recorrente. Envie `product_id`, `title`, `url` e opcionalmente `interval_minutes` (5–10080); exige `Authorization: Bearer <ALERT_ADMIN_TOKEN>`.
 - `GET /admin/products`: lista anúncios acompanhados e último preço observado; exige token administrativo.
 - `DELETE /admin/products/{product_id}`: pausa um anúncio sem apagar o histórico; exige token administrativo.

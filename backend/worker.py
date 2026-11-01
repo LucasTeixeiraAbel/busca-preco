@@ -397,34 +397,6 @@ async def consume() -> None:
             await asyncio.sleep(1)
 
 
-@app.post("/observations", status_code=202)
-async def enqueue_observation(payload: Observation, request: Request) -> dict[str, str]:
-    # Redis-backed per-IP token bucket; configure trusted proxies before using X-Forwarded-For.
-    client_ip = request.client.host if request.client else "unknown"
-    key = f"rate:observations:{client_ip}"
-    allowed = await redis.eval(
-        "local n=redis.call('INCR',KEYS[1]); if n==1 then redis.call('EXPIRE',KEYS[1],60) end; return n",
-        1, key,
-    )
-    if int(allowed) > int(os.getenv("OBSERVATION_RATE_PER_MIN", "120")):
-        raise HTTPException(status_code=429, detail="Limite de requisições excedido")
-    try:
-        validate_store_url(str(payload.url))
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail="URL de loja não autorizada") from exc
-    if payload.store != store_label_for_url(str(payload.url)):
-        raise HTTPException(status_code=422, detail="Nome da loja não corresponde ao domínio validado")
-    if payload.source_url:
-        try:
-            validate_store_url(str(payload.source_url))
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail="URL original não autorizada") from exc
-        if store_label_for_url(str(payload.source_url)) != payload.store:
-            raise HTTPException(status_code=422, detail="URL original deve pertencer à mesma loja")
-    entry_id = await redis.xadd(STREAM, {"data": payload.model_dump_json()})
-    return {"queued": entry_id}
-
-
 @app.get("/feed")
 async def get_feed() -> list[dict[str, Any]]:
     # Redis cache read; API gateways should also enforce a global rate limit.
@@ -440,8 +412,14 @@ async def get_feed() -> list[dict[str, Any]]:
 
 
 @app.post("/scrape", status_code=202)
-async def enqueue_scrape(payload: ScrapeJob, request: Request) -> dict[str, str]:
+async def enqueue_scrape(
+    payload: ScrapeJob,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, str]:
     """Schedule one allowlisted store URL for the dedicated Playwright process."""
+    authorize_admin(authorization)
+    await admin_rate_limit(request, "scrape")
     client_ip = request.client.host if request.client else "unknown"
     key = f"rate:scrape:{client_ip}"
     count = await redis.eval("local n=redis.call('INCR',KEYS[1]); if n==1 then redis.call('EXPIRE',KEYS[1],60) end; return n", 1, key)

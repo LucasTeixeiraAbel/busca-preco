@@ -5,7 +5,7 @@ import hashlib
 from contextlib import asynccontextmanager
 from fastapi.security import HTTPAuthorizationCredentials
 
-from backend.scraper import parse_price
+from backend.scraper import guard_navigation, parse_price
 from fastapi import HTTPException
 
 import backend.worker as worker
@@ -153,6 +153,51 @@ def test_rejects_unsafe_store_urls(url):
 def test_accepts_allowlisted_https_store_url():
     url = "https://www.amazon.com.br/dp/example"
     assert validate_store_url(url) == url
+
+
+def test_scrape_route_requires_admin_and_observations_route_is_removed():
+    routes = {getattr(route, "path", None): route for route in worker.app.routes}
+    assert "/observations" not in routes
+    scrape_route = routes["/scrape"].endpoint
+    request = worker.Request({
+        "type": "http", "method": "POST", "path": "/scrape", "headers": [],
+        "client": ("127.0.0.1", 12345), "server": ("localhost", 8000),
+        "scheme": "http", "query_string": b"", "root_path": "",
+    })
+    payload = ScrapeJob(product_id="console", url="https://www.amazon.com.br/dp/example")
+    with pytest.raises(HTTPException) as failure:
+        asyncio.run(scrape_route(payload, request, None))
+    assert failure.value.status_code == 401
+
+
+def test_navigation_guard_aborts_untrusted_document_redirect_but_allows_subresources():
+    class Request:
+        resource_type = "document"
+        url = "https://evil.example/phishing"
+
+        def is_navigation_request(self):
+            return True
+
+    class Route:
+        request = Request()
+
+        def __init__(self):
+            self.action = None
+
+        async def abort(self):
+            self.action = "abort"
+
+        async def continue_(self):
+            self.action = "continue"
+
+    bad_document = Route()
+    asyncio.run(guard_navigation(bad_document))
+    assert bad_document.action == "abort"
+
+    subresource = Route()
+    subresource.request.resource_type = "image"
+    asyncio.run(guard_navigation(subresource))
+    assert subresource.action == "continue"
 
 
 def test_scrape_job_does_not_require_a_fake_price_and_store_is_domain_derived():

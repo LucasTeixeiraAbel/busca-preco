@@ -2,7 +2,11 @@ import asyncio
 import hashlib
 from contextlib import asynccontextmanager
 
+import httpx
+import pytest
+
 from backend import telegram_bot
+from backend.telegram_api import call
 
 
 def test_telegram_start_consumes_one_time_token_and_links_private_chat(monkeypatch):
@@ -65,3 +69,16 @@ def test_telegram_stop_disables_linked_chat(monkeypatch):
     assert "UPDATE telegram_chats SET enabled=FALSE" in state["query"]
     assert state["chat_id"] == 55
     assert "desativados" in state["message"]
+
+
+def test_telegram_api_error_never_exposes_bot_token():
+    token = "private-bot-token-value"
+
+    class Client:
+        async def post(self, url, **_kwargs):
+            raise httpx.ConnectError(f"connection failed for {url}")
+
+    with pytest.raises(RuntimeError) as failure:
+        asyncio.run(call(Client(), token, "sendMessage", {"chat_id": 1}))
+    assert token not in str(failure.value)
+    assert failure.value.__cause__ is None
