@@ -24,6 +24,7 @@ from redis.exceptions import ResponseError
 import asyncpg
 from dotenv import load_dotenv
 from .mailer import send_email as send_transactional_email
+from .streams import reclaim_and_process
 
 load_dotenv()
 
@@ -370,6 +371,7 @@ async def consume() -> None:
     except ResponseError as exc:
         if "BUSYGROUP" not in str(exc):
             raise
+    last_reclaim = asyncio.get_running_loop().time()
     while True:
         try:
             batches = await redis.xreadgroup(GROUP, CONSUMER, {STREAM: ">"}, count=50, block=1000)
@@ -379,6 +381,15 @@ async def consume() -> None:
                         await process_message(redis, message_id, fields)
                     except Exception:
                         log.exception("message failed; leaving pending for retry id=%s", message_id)
+            if asyncio.get_running_loop().time() - last_reclaim >= 30:
+                await reclaim_and_process(
+                    redis, STREAM, GROUP, CONSUMER,
+                    lambda message_id, fields: process_message(redis, message_id, fields),
+                    min_idle_ms=int(os.getenv("RECLAIM_IDLE_MS", "60000")),
+                    max_deliveries=int(os.getenv("MAX_DELIVERIES", "5")),
+                    dead_stream="price:observations:dead",
+                )
+                last_reclaim = asyncio.get_running_loop().time()
         except asyncio.CancelledError:
             raise
         except Exception:

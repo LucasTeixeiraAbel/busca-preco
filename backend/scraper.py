@@ -115,8 +115,10 @@ async def run() -> None:
                                 observation = {"product_id": job["product_id"], "store": store_label_for_url(final_url), "price": price, "url": final_url, "source_url": url}
                                 await redis.xadd("price:observations", {"data": json.dumps(observation)})
                                 await redis.xack(JOBS, GROUP, message_id)
-                            except Exception:
-                                log.exception("scrape failed id=%s", message_id)
+                            except Exception as exc:
+                                # The scheduler will enqueue the offer again; do not grow the PEL.
+                                log.warning("scrape failed id=%s error=%s", message_id, type(exc).__name__)
+                                await redis.xack(JOBS, GROUP, message_id)
             finally:
                 await browser.close()
     finally:
