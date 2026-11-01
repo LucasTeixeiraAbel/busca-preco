@@ -1,6 +1,7 @@
 import asyncio
 import json
 from datetime import datetime, timedelta, timezone
+from contextlib import asynccontextmanager
 
 import pytest
 
@@ -26,19 +27,47 @@ class _DbConnection:
             for index, price in enumerate([3499.0, 3499.9] * 10)
         ]
         self.inserted = 0
+        self.outbox = []
+        self.fail_outbox_mark = False
 
     async def fetch(self, query, *_args):
+        if "alerts_outbox" in query:
+            return [row for row in self.outbox if row["published_at"] is None]
         assert "price_observations" in query
         return self.history
 
     async def fetchval(self, query, *_args):
         if "SELECT title" in query:
             return "[TESTE] PlayStation 5"
+        if "pg_advisory_xact_lock" in query:
+            return None
+        if "SELECT 1 FROM alerts_outbox" in query:
+            return 1 if any(row["published_at"] is None for row in self.outbox) else None
         self.inserted += 1
         return self.inserted
 
-    async def execute(self, *_args):
+    async def execute(self, query, *args):
+        if "INSERT INTO alerts_outbox" in query:
+            self.outbox.append({
+                "id": len(self.outbox) + 1,
+                "product_id": args[0],
+                "store": args[1],
+                "offer_key": args[2],
+                "payload": json.loads(args[3]),
+                "published_at": None,
+            })
+        elif "UPDATE alerts_outbox" in query:
+            if self.fail_outbox_mark:
+                self.fail_outbox_mark = False
+                raise RuntimeError("simulated PostgreSQL commit failure")
+            for row in self.outbox:
+                if row["id"] == args[0]:
+                    row["published_at"] = datetime.now(timezone.utc)
         return "UPDATE 1"
+
+    @asynccontextmanager
+    async def transaction(self):
+        yield
 
 
 class _DbPool:
@@ -148,10 +177,15 @@ def test_dry_run_anomaly_confirmation_cooldown_and_partial_delivery(monkeypatch)
     }
 
     async def process_three_reads():
+        results = []
         for index in range(1, 4):
-            await worker.process_message(redis, f"{index}-0", {"data": json.dumps(item)})
+            results.append(await worker.process_message(redis, f"{index}-0", {"data": json.dumps(item)}))
+        return results
 
-    asyncio.run(process_three_reads())
+    assert asyncio.run(process_three_reads()) == [False, True, False]
+    assert len(worker.db.connection.outbox) == 1
+    assert not redis.streams.get("alerts:detected")
+    asyncio.run(worker.publish_outbox(worker.db, redis))
     alerts = redis.streams.get("alerts:detected", [])
     assert len(alerts) == 1
     alert_id, alert_fields = alerts[0]
@@ -181,3 +215,39 @@ def test_dry_run_anomaly_confirmation_cooldown_and_partial_delivery(monkeypatch)
     assert attempts.count("third@example.com") == 1
     assert attempts.count("second@example.com") == 2
     assert len(redis.streams["alerts:detected"]) == 1
+
+
+def test_outbox_republish_uses_stable_delivery_id_after_partial_publish(monkeypatch):
+    pool = _DbPool()
+    pool.connection.outbox.append({
+        "id": 44,
+        "product_id": "dry-run-ps5",
+        "store": "Amazon",
+        "offer_key": "offer-hash",
+        "payload": {"product_id": "dry-run-ps5", "store": "Amazon", "price": 2000, "url": "https://www.amazon.com.br/dp/example"},
+        "published_at": None,
+    })
+    pool.connection.fail_outbox_mark = True
+    redis = _Redis()
+
+    with pytest.raises(RuntimeError, match="commit failure"):
+        asyncio.run(worker.publish_outbox(pool, redis))
+    asyncio.run(worker.publish_outbox(pool, redis))
+    entries = redis.streams["alerts:detected"]
+    assert len(entries) == 2
+    assert {json.loads(fields["data"])["outbox_id"] for _, fields in entries} == {"44"}
+
+    notifier_pool = _NotifyPool()
+    monkeypatch.setattr(notify.app.state, "db", notifier_pool)
+    monkeypatch.delenv("VAPID_PRIVATE_KEY", raising=False)
+    attempts = []
+
+    async def send_email(email, _alert):
+        attempts.append(email)
+
+    monkeypatch.setattr(notify, "send_email", send_email)
+    alert = json.loads(entries[0][1]["data"])
+    asyncio.run(notify.deliver(redis, entries[0][0], alert))
+    asyncio.run(notify.deliver(redis, entries[1][0], json.loads(entries[1][1]["data"])))
+    assert len(attempts) == len(notifier_pool.emails)
+    assert len(set(attempts)) == len(notifier_pool.emails)

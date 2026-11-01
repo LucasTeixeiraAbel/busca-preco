@@ -119,14 +119,14 @@ class MemoryRedis:
         return f"{len(self.streams[stream])}-0"
 
 
-def test_anomaly_requires_confirmation_and_cooldown_suppresses_repeats():
+def test_anomaly_requires_two_matching_reads_before_creating_outbox_event():
     redis = MemoryRedis()
     observation = Observation(product_id="console", store="Amazon", price=2100, url="https://www.amazon.com.br/dp/example")
 
     assert asyncio.run(should_alert(redis, observation, str(observation.url))) is False
     assert len(redis.streams["scrape:jobs"]) == 1
     assert asyncio.run(should_alert(redis, observation, str(observation.url))) is True
-    assert asyncio.run(should_alert(redis, observation, str(observation.url))) is False
+    assert not any(key.startswith("alert:cd:") for key in redis.values)
     assert len(redis.streams["scrape:jobs"]) == 1
 
 

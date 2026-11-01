@@ -42,6 +42,7 @@ async def send_telegram(chat_id: int, item: dict) -> None:
 
 async def deliver(redis: Redis, stream_id: str, item: dict) -> None:
     pool = app.state.db
+    delivery_id = str(item.get("outbox_id") or stream_id)
     async with pool.acquire() as conn:
         emails = await conn.fetch("SELECT email FROM alert_subscribers WHERE enabled")
         pushes = await conn.fetch("SELECT endpoint, subscription FROM push_subscriptions WHERE enabled")
@@ -82,7 +83,7 @@ async def deliver(redis: Redis, stream_id: str, item: dict) -> None:
     async def send_once(channel: str, destination: str, send: Any) -> bool:
         already = await pool.fetchval(
             "SELECT 1 FROM alert_deliveries WHERE alert_id=$1 AND channel=$2 AND destination=$3",
-            stream_id, channel, destination,
+            delivery_id, channel, destination,
         )
         if already:
             return True
@@ -94,7 +95,7 @@ async def deliver(redis: Redis, stream_id: str, item: dict) -> None:
             return False
         await pool.execute(
             "INSERT INTO alert_deliveries(alert_id,channel,destination) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",
-            stream_id, channel, destination,
+            delivery_id, channel, destination,
         )
         return True
 

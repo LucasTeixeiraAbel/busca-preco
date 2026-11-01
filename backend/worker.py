@@ -269,8 +269,12 @@ def has_minimum_history_coverage(rows: list[dict[str, Any]], now: datetime | Non
     return (now - oldest).total_seconds() >= MIN_HISTORY_COVERAGE_HOURS * 3600
 
 
+def offer_fingerprint(source_url: str) -> str:
+    return hashlib.sha256(source_url.encode()).hexdigest()[:16]
+
+
 def anomaly_keys(obs: Observation, source_url: str) -> tuple[str, str]:
-    offer_hash = hashlib.sha256(source_url.encode()).hexdigest()[:16]
+    offer_hash = offer_fingerprint(source_url)
     prefix = f"{obs.product_id}:{obs.store}:{offer_hash}"
     return f"anomaly:pending:{prefix}", f"alert:cd:{prefix}"
 
@@ -300,12 +304,37 @@ async def should_alert(client: Redis, obs: Observation, source_url: str) -> bool
         await client.xadd("scrape:jobs", {"data": json.dumps({"product_id": obs.product_id, "url": source_url})})
         return False
 
+    # The durable outbox publisher applies the cooldown after the transaction commits.
     await client.delete(pending_key)
-    await client.set(cooldown_key, str(obs.price), ex=ALERT_COOLDOWN_SECONDS)
     return True
 
 
-async def process_message(client: Redis, message_id: str, fields: dict[str, Any]) -> None:
+async def publish_outbox(pool: Any, client: Redis) -> int:
+    """Publish committed alerts; outbox_id makes a repeated XADD delivery-idempotent."""
+    published = 0
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            rows = await conn.fetch(
+                "SELECT id,product_id,store,offer_key,payload FROM alerts_outbox "
+                "WHERE published_at IS NULL ORDER BY id LIMIT 20 FOR UPDATE SKIP LOCKED"
+            )
+            for row in rows:
+                payload = row["payload"]
+                if isinstance(payload, str):
+                    payload = json.loads(payload)
+                item = dict(payload)
+                outbox_id = str(row["id"])
+                item["outbox_id"] = outbox_id
+                cooldown_key = f"alert:cd:{row['product_id']}:{row['store']}:{row['offer_key']}"
+                await client.set(cooldown_key, str(item["price"]), ex=ALERT_COOLDOWN_SECONDS)
+                await client.xadd("alerts:detected", {"data": json.dumps(item)})
+                await conn.execute("UPDATE alerts_outbox SET published_at=now() WHERE id=$1", row["id"])
+                published += 1
+                log.info("published outbox alert id=%s", outbox_id)
+    return published
+
+
+async def process_message(client: Redis, message_id: str, fields: dict[str, Any]) -> bool:
     data = json.loads(fields["data"])
     obs = Observation.model_validate(data)
     safe_url = validate_store_url(str(obs.url))
@@ -332,36 +361,52 @@ async def process_message(client: Redis, message_id: str, fields: dict[str, Any]
         "score": round(score, 3),
     }
     async with db.acquire() as conn:
-        inserted = await conn.fetchval(
-            "INSERT INTO price_observations(stream_id,product_id,store,price,url) VALUES($1,$2,$3,$4,$5) ON CONFLICT(stream_id) DO NOTHING RETURNING id",
-            message_id, obs.product_id, obs.store, obs.price, safe_url,
-        )
-        if inserted is not None:
-            await conn.execute(
-                "UPDATE product_offers SET last_price=$3,last_observed_at=now(),updated_at=now() "
-                "WHERE product_id=$1 AND url=$2",
-                obs.product_id, source_url, obs.price,
+        async with conn.transaction():
+            inserted = await conn.fetchval(
+                "INSERT INTO price_observations(stream_id,product_id,store,price,url) VALUES($1,$2,$3,$4,$5) ON CONFLICT(stream_id) DO NOTHING RETURNING id",
+                message_id, obs.product_id, obs.store, obs.price, safe_url,
             )
+            if inserted is not None:
+                await conn.execute(
+                    "UPDATE product_offers SET last_price=$3,last_observed_at=now(),updated_at=now() "
+                    "WHERE product_id=$1 AND url=$2",
+                    obs.product_id, source_url, obs.price,
+                )
+                if anomalous:
+                    offer_key = offer_fingerprint(source_url)
+                    await conn.fetchval(
+                        "SELECT pg_advisory_xact_lock(hashtext($1),hashtext($2))",
+                        obs.product_id, f"{obs.store}:{offer_key}",
+                    )
+                    waiting_outbox = await conn.fetchval(
+                        "SELECT 1 FROM alerts_outbox WHERE product_id=$1 AND store=$2 "
+                        "AND offer_key=$3 AND published_at IS NULL LIMIT 1",
+                        obs.product_id, obs.store, offer_key,
+                    )
+                    if not waiting_outbox:
+                        confirmed = await should_alert(client, obs, source_url)
+                else:
+                    await clear_pending_anomaly(client, obs, source_url)
+                item["confirmed"] = confirmed
+                if confirmed:
+                    await conn.execute(
+                        "INSERT INTO alerts_outbox(product_id,store,offer_key,payload) "
+                        "VALUES($1,$2,$3,$4::jsonb)",
+                        obs.product_id, obs.store, offer_fingerprint(source_url), json.dumps(item),
+                    )
     if inserted is None:
         await client.xack(STREAM, GROUP, message_id)
-        return
-    if anomalous:
-        confirmed = await should_alert(client, obs, source_url)
-    else:
-        await clear_pending_anomaly(client, obs, source_url)
-    item["confirmed"] = confirmed
+        return False
     # PostgreSQL is the durable source; Redis keeps the hot history/feed cache.
     pipe = client.pipeline(transaction=True)
     pipe.lpush(history_key, obs.price)
     pipe.ltrim(history_key, 0, 99)
     pipe.lpush(FEED_KEY, json.dumps(item))
     pipe.ltrim(FEED_KEY, 0, 199)
-    if confirmed:
-        # A downstream alert consumer handles SES/SendGrid and push delivery.
-        pipe.xadd("alerts:detected", {"data": json.dumps(item)})
     pipe.xack(STREAM, GROUP, message_id)
     await pipe.execute()
     log.info("processed product=%s anomaly=%s score=%.2f", obs.product_id, anomalous, score)
+    return confirmed
 
 
 async def consume() -> None:
@@ -372,24 +417,33 @@ async def consume() -> None:
         if "BUSYGROUP" not in str(exc):
             raise
     last_reclaim = asyncio.get_running_loop().time()
+    last_outbox_poll = 0.0
+
+    async def process_and_publish(message_id: str, fields: dict[str, Any]) -> None:
+        if await process_message(redis, message_id, fields):
+            await publish_outbox(db, redis)
+
     while True:
         try:
             batches = await redis.xreadgroup(GROUP, CONSUMER, {STREAM: ">"}, count=50, block=1000)
             for _, messages in batches:
                 for message_id, fields in messages:
                     try:
-                        await process_message(redis, message_id, fields)
+                        await process_and_publish(message_id, fields)
                     except Exception:
                         log.exception("message failed; leaving pending for retry id=%s", message_id)
             if asyncio.get_running_loop().time() - last_reclaim >= 30:
                 await reclaim_and_process(
                     redis, STREAM, GROUP, CONSUMER,
-                    lambda message_id, fields: process_message(redis, message_id, fields),
+                    process_and_publish,
                     min_idle_ms=int(os.getenv("RECLAIM_IDLE_MS", "60000")),
                     max_deliveries=int(os.getenv("MAX_DELIVERIES", "5")),
                     dead_stream="price:observations:dead",
                 )
                 last_reclaim = asyncio.get_running_loop().time()
+            if asyncio.get_running_loop().time() - last_outbox_poll >= 1:
+                await publish_outbox(db, redis)
+                last_outbox_poll = asyncio.get_running_loop().time()
         except asyncio.CancelledError:
             raise
         except Exception:
