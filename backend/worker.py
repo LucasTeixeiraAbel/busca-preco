@@ -39,6 +39,13 @@ ALLOWED_HOSTS = {h.strip().lower() for h in os.getenv(
 MIN_HISTORY = int(os.getenv("MIN_HISTORY", "8"))
 MAD_Z_THRESHOLD = float(os.getenv("MAD_Z_THRESHOLD", "6.0"))
 ZERO_MAD_DROP_RATIO = float(os.getenv("ZERO_MAD_DROP_RATIO", "0.35"))
+MIN_DROP_RATIO = float(os.getenv("MIN_DROP_RATIO", "0.25"))
+BASELINE_DAYS = int(os.getenv("BASELINE_DAYS", "14"))
+MIN_HISTORY_COVERAGE_HOURS = float(os.getenv("MIN_HISTORY_COVERAGE_HOURS", "6"))
+CONFIRM_WINDOW_SECONDS = int(os.getenv("CONFIRM_WINDOW_SECONDS", "1800"))
+CONFIRM_TOLERANCE = float(os.getenv("CONFIRM_TOLERANCE", "0.05"))
+ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "21600"))
+REALERT_EXTRA_DROP = float(os.getenv("REALERT_EXTRA_DROP", "0.10"))
 
 redis: Redis | None = None
 db: asyncpg.Pool | None = None
@@ -227,15 +234,74 @@ def detect_anomaly(history: list[float], current: float) -> tuple[bool, float]:
     if len(history) < MIN_HISTORY:
         return False, 0.0
     center = statistics.median(history)
-    mad = statistics.median(abs(item - center) for item in history)
     if center <= 0:
         return False, 0.0
-    # A perfectly stable history has MAD=0; treat a material relative drop as anomalous.
+    drop = (center - current) / center
+    if drop < MIN_DROP_RATIO:
+        return False, -drop
+    mad = statistics.median(abs(item - center) for item in history)
     if mad == 0:
-        relative_score = (current - center) / center
-        return relative_score <= -ZERO_MAD_DROP_RATIO, relative_score
+        return drop >= ZERO_MAD_DROP_RATIO, -drop
     score = 0.6745 * (current - center) / mad
     return score <= -MAD_Z_THRESHOLD, score
+
+
+async def load_store_history(conn: Any, product_id: str, store: str) -> list[dict[str, Any]]:
+    return await conn.fetch(
+        "SELECT price,observed_at FROM price_observations "
+        "WHERE product_id=$1 AND store=$2 AND observed_at > now() - ($3 * interval '1 day') "
+        "ORDER BY observed_at DESC LIMIT 2000",
+        product_id, store, BASELINE_DAYS,
+    )
+
+
+def has_minimum_history_coverage(rows: list[dict[str, Any]], now: datetime | None = None) -> bool:
+    if len(rows) < MIN_HISTORY or not rows:
+        return False
+    observed_at = [row.get("observed_at") for row in rows if row.get("observed_at") is not None]
+    if len(observed_at) < MIN_HISTORY:
+        return False
+    now = now or datetime.now(timezone.utc)
+    oldest = min(observed_at)
+    if oldest.tzinfo is None:
+        oldest = oldest.replace(tzinfo=timezone.utc)
+    return (now - oldest).total_seconds() >= MIN_HISTORY_COVERAGE_HOURS * 3600
+
+
+def anomaly_keys(obs: Observation, source_url: str) -> tuple[str, str]:
+    offer_hash = hashlib.sha256(source_url.encode()).hexdigest()[:16]
+    prefix = f"{obs.product_id}:{obs.store}:{offer_hash}"
+    return f"anomaly:pending:{prefix}", f"alert:cd:{prefix}"
+
+
+async def clear_pending_anomaly(client: Redis, obs: Observation, source_url: str) -> None:
+    pending_key, _ = anomaly_keys(obs, source_url)
+    await client.delete(pending_key)
+
+
+async def should_alert(client: Redis, obs: Observation, source_url: str) -> bool:
+    """Confirm a low price with an immediate second scrape and enforce per-offer cooldown."""
+    pending_key, cooldown_key = anomaly_keys(obs, source_url)
+    last_alerted = await client.get(cooldown_key)
+    if last_alerted is not None and obs.price > float(last_alerted) * (1 - REALERT_EXTRA_DROP):
+        await client.delete(pending_key)
+        return False
+
+    previous = await client.get(pending_key)
+    if previous is None:
+        await client.set(pending_key, str(obs.price), ex=CONFIRM_WINDOW_SECONDS)
+        await client.xadd("scrape:jobs", {"data": json.dumps({"product_id": obs.product_id, "url": source_url})})
+        return False
+
+    previous_price = float(previous)
+    if previous_price <= 0 or abs(obs.price - previous_price) / previous_price > CONFIRM_TOLERANCE:
+        await client.set(pending_key, str(obs.price), ex=CONFIRM_WINDOW_SECONDS)
+        await client.xadd("scrape:jobs", {"data": json.dumps({"product_id": obs.product_id, "url": source_url})})
+        return False
+
+    await client.delete(pending_key)
+    await client.set(cooldown_key, str(obs.price), ex=ALERT_COOLDOWN_SECONDS)
+    return True
 
 
 async def process_message(client: Redis, message_id: str, fields: dict[str, Any]) -> None:
@@ -243,19 +309,25 @@ async def process_message(client: Redis, message_id: str, fields: dict[str, Any]
     obs = Observation.model_validate(data)
     safe_url = validate_store_url(str(obs.url))
     source_url = validate_store_url(str(obs.source_url)) if obs.source_url else safe_url
-    history_key = f"price:history:{obs.product_id}"
+    history_key = f"price:history:{obs.product_id}:{obs.store}"
     async with db.acquire() as conn:
-        rows = await conn.fetch("SELECT price FROM price_observations WHERE product_id=$1 ORDER BY observed_at DESC LIMIT 100", obs.product_id)
+        rows = await load_store_history(conn, obs.product_id, obs.store)
         title = await conn.fetchval("SELECT title FROM tracked_products WHERE product_id=$1", obs.product_id)
     history = [float(row["price"]) for row in rows]
-    anomalous, score = detect_anomaly(history, obs.price)
+    if has_minimum_history_coverage(rows):
+        anomalous, score = detect_anomaly(history, obs.price)
+    else:
+        anomalous, score = False, 0.0
+    previous_price = statistics.median(history) if history else None
+    confirmed = False
     item = {
         **obs.model_dump(mode="json", exclude={"source_url"}),
         "title": title or obs.product_id,
-        "previousPrice": statistics.median(history) if history else None,
+        "previousPrice": previous_price,
         "observed_at": datetime.now(timezone.utc).isoformat(),
         "url": safe_url,
         "anomaly": anomalous,
+        "confirmed": confirmed,
         "score": round(score, 3),
     }
     async with db.acquire() as conn:
@@ -272,13 +344,18 @@ async def process_message(client: Redis, message_id: str, fields: dict[str, Any]
     if inserted is None:
         await client.xack(STREAM, GROUP, message_id)
         return
+    if anomalous:
+        confirmed = await should_alert(client, obs, source_url)
+    else:
+        await clear_pending_anomaly(client, obs, source_url)
+    item["confirmed"] = confirmed
     # PostgreSQL is the durable source; Redis keeps the hot history/feed cache.
     pipe = client.pipeline(transaction=True)
     pipe.lpush(history_key, obs.price)
     pipe.ltrim(history_key, 0, 99)
     pipe.lpush(FEED_KEY, json.dumps(item))
     pipe.ltrim(FEED_KEY, 0, 199)
-    if anomalous:
+    if confirmed:
         # A downstream alert consumer handles SES/SendGrid and push delivery.
         pipe.xadd("alerts:detected", {"data": json.dumps(item)})
     pipe.xack(STREAM, GROUP, message_id)

@@ -11,12 +11,17 @@ from fastapi import HTTPException
 import backend.worker as worker
 from backend.worker import (
     MagicLinkVerification,
+    Observation,
     ProductCreate,
     authorize_admin,
     current_user,
     detect_anomaly,
+    has_minimum_history_coverage,
     issue_user_token,
     make_telegram_deep_link,
+    load_store_history,
+    should_alert,
+    clear_pending_anomaly,
     ScrapeJob,
     store_label_for_url,
     validate_push_endpoint,
@@ -47,6 +52,91 @@ def test_constant_price_history_can_detect_material_drop():
     anomalous, score = detect_anomaly([100.0] * 8, 50.0)
     assert anomalous is True
     assert score == -0.5
+
+
+def test_small_cent_drop_is_not_an_anomaly_when_mad_is_nonzero():
+    history = [3499.0, 3499.9] * 10
+    anomalous, _ = detect_anomaly(history, 3489.0)
+    assert anomalous is False
+
+
+def test_stable_price_drop_below_relative_floor_is_not_an_anomaly():
+    anomalous, _ = detect_anomaly([3499.0] * 20, 3149.0)
+    assert anomalous is False
+
+
+def test_stable_price_drop_above_relative_floor_is_an_anomaly():
+    anomalous, _ = detect_anomaly([3499.0] * 20, 2099.0)
+    assert anomalous is True
+
+
+def test_material_drop_is_detected_against_only_the_store_baseline():
+    history = [3499.0, 3499.9] * 10
+    anomalous, _ = detect_anomaly(history, 2449.0)
+    assert anomalous is True
+
+
+def test_store_history_query_filters_by_product_store_and_time_window():
+    class FakeConnection:
+        async def fetch(self, query, product_id, store, days):
+            assert "product_id=$1 AND store=$2" in query
+            assert "interval '1 day'" in query
+            assert "LIMIT 2000" in query
+            assert (product_id, store, days) == ("console", "Amazon", worker.BASELINE_DAYS)
+            return [{"price": 100.0, "observed_at": None}]
+
+    rows = asyncio.run(load_store_history(FakeConnection(), "console", "Amazon"))
+    assert rows[0]["price"] == 100.0
+
+
+def test_history_coverage_requires_minimum_dayspan():
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    six_hour_history = [{"observed_at": now - timedelta(hours=6 + i / 100)} for i in range(8)]
+    short_history = [{"observed_at": now - timedelta(hours=5)} for _ in range(8)]
+    assert has_minimum_history_coverage(six_hour_history, now)
+    assert not has_minimum_history_coverage(short_history, now)
+
+
+class MemoryRedis:
+    def __init__(self):
+        self.values = {}
+        self.streams = {}
+
+    async def get(self, key):
+        return self.values.get(key)
+
+    async def set(self, key, value, ex=None):
+        self.values[key] = value
+
+    async def delete(self, key):
+        self.values.pop(key, None)
+
+    async def xadd(self, stream, fields):
+        self.streams.setdefault(stream, []).append(fields)
+        return f"{len(self.streams[stream])}-0"
+
+
+def test_anomaly_requires_confirmation_and_cooldown_suppresses_repeats():
+    redis = MemoryRedis()
+    observation = Observation(product_id="console", store="Amazon", price=2100, url="https://www.amazon.com.br/dp/example")
+
+    assert asyncio.run(should_alert(redis, observation, str(observation.url))) is False
+    assert len(redis.streams["scrape:jobs"]) == 1
+    assert asyncio.run(should_alert(redis, observation, str(observation.url))) is True
+    assert asyncio.run(should_alert(redis, observation, str(observation.url))) is False
+    assert len(redis.streams["scrape:jobs"]) == 1
+
+
+def test_normal_reading_clears_pending_anomaly_without_alert():
+    redis = MemoryRedis()
+    observation = Observation(product_id="console", store="Amazon", price=2100, url="https://www.amazon.com.br/dp/example")
+
+    asyncio.run(should_alert(redis, observation, str(observation.url)))
+    asyncio.run(clear_pending_anomaly(redis, observation, str(observation.url)))
+    assert not redis.values
+    assert len(redis.streams["scrape:jobs"]) == 1
 
 
 @pytest.mark.parametrize("url", [

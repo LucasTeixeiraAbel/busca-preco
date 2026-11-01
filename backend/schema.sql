@@ -10,6 +10,8 @@ CREATE TABLE IF NOT EXISTS price_observations (
 );
 CREATE INDEX IF NOT EXISTS price_observations_product_time_idx
   ON price_observations (product_id, observed_at DESC) INCLUDE (price);
+CREATE INDEX IF NOT EXISTS idx_price_obs_product_store_time
+  ON price_observations(product_id, store, observed_at DESC);
 CREATE INDEX IF NOT EXISTS price_observations_time_idx ON price_observations (observed_at DESC);
 
 CREATE TABLE IF NOT EXISTS tracked_products (
