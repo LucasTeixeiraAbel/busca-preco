@@ -10,6 +10,7 @@ import asyncpg
 from dotenv import load_dotenv
 from redis.asyncio import Redis
 
+from .discovery import discover_due
 from .worker import REDIS_URL
 
 load_dotenv()
@@ -17,6 +18,7 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("product-scheduler")
 BATCH_SIZE = int(os.getenv("SCHEDULER_BATCH_SIZE", "50"))
 POLL_SECONDS = float(os.getenv("SCHEDULER_POLL_SECONDS", "5"))
+DISCOVERY_ENABLED = os.getenv("DISCOVERY_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 
 async def dispatch_due_products(pool: asyncpg.Pool, redis: Redis) -> int:
@@ -52,6 +54,10 @@ async def run() -> None:
                 count = await dispatch_due_products(pool, redis)
                 if count:
                     log.info("queued %s due product checks", count)
+                if DISCOVERY_ENABLED:
+                    discovered = await discover_due(pool)
+                    if discovered:
+                        log.info("automatically enrolled %s product offers", discovered)
             except asyncio.CancelledError:
                 raise
             except Exception:

@@ -26,10 +26,14 @@ CREATE TABLE IF NOT EXISTS tracked_products (
   last_observed_at TIMESTAMPTZ,
   last_price NUMERIC(14, 2),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  canonical_key TEXT,
+  auto_discovered BOOLEAN NOT NULL DEFAULT FALSE
 );
 CREATE INDEX IF NOT EXISTS tracked_products_due_idx
   ON tracked_products (next_check_at) WHERE enabled;
+CREATE UNIQUE INDEX IF NOT EXISTS tracked_products_canonical_key_uidx
+  ON tracked_products(canonical_key) WHERE canonical_key IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS product_offers (
   offer_id BIGSERIAL PRIMARY KEY,
@@ -46,12 +50,24 @@ CREATE TABLE IF NOT EXISTS product_offers (
   last_error TEXT,
   last_failure_at TIMESTAMPTZ,
   last_failure_alerted_at TIMESTAMPTZ,
+  auto_discovered BOOLEAN NOT NULL DEFAULT FALSE,
+  discovery_query TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (product_id, url)
 );
 CREATE INDEX IF NOT EXISTS product_offers_due_idx
   ON product_offers (next_check_at, offer_id) WHERE enabled;
+
+CREATE TABLE IF NOT EXISTS catalog_discovery_sources (
+  store TEXT PRIMARY KEY,
+  query_index INTEGER NOT NULL DEFAULT 0 CHECK (query_index >= 0),
+  last_query TEXT,
+  next_run_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_success_at TIMESTAMPTZ,
+  last_error TEXT,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
 CREATE TABLE IF NOT EXISTS alert_subscribers (
   email TEXT PRIMARY KEY,

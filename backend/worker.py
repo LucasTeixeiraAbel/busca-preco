@@ -33,10 +33,21 @@ log = logging.getLogger("price-worker")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 STREAM, GROUP, CONSUMER = "price:observations", "price-detectors", os.getenv("WORKER_ID", "detector-1")
 FEED_KEY = "feed:latest"
-ALLOWED_HOSTS = {h.strip().lower() for h in os.getenv(
+_CONFIGURED_STORE_HOSTS = {h.strip().lower() for h in os.getenv(
     "STORE_ALLOWLIST",
     "amazon.com.br,www.amazon.com.br,kabum.com.br,www.kabum.com.br",
 ).split(",") if h.strip()}
+# Exact hosts for the built-in discovery adapters. These are deliberately exact
+# (no wildcards), so allowing catalog discovery cannot turn the scraper into an SSRF proxy.
+DISCOVERY_STORE_HOSTS = {
+    "amazon.com.br", "www.amazon.com.br",
+    "kabum.com.br", "www.kabum.com.br",
+    "casasbahia.com.br", "www.casasbahia.com.br",
+    "magazineluiza.com.br", "www.magazineluiza.com.br",
+    "mercadolivre.com.br", "www.mercadolivre.com.br",
+    "produto.mercadolivre.com.br", "lista.mercadolivre.com.br",
+}
+ALLOWED_HOSTS = _CONFIGURED_STORE_HOSTS | DISCOVERY_STORE_HOSTS
 MIN_HISTORY = int(os.getenv("MIN_HISTORY", "8"))
 MAD_Z_THRESHOLD = float(os.getenv("MAD_Z_THRESHOLD", "6.0"))
 ZERO_MAD_DROP_RATIO = float(os.getenv("ZERO_MAD_DROP_RATIO", "0.35"))
@@ -221,9 +232,15 @@ def store_label_for_url(value: str) -> str:
         "www.amazon.com.br": "Amazon",
         "kabum.com.br": "KaBuM",
         "www.kabum.com.br": "KaBuM",
+        "casasbahia.com.br": "Casas Bahia",
+        "www.casasbahia.com.br": "Casas Bahia",
         "secure3.fastshop.com.br": "Fast Shop",
         "magazineluiza.com.br": "Magazine Luiza",
         "www.magazineluiza.com.br": "Magazine Luiza",
+        "mercadolivre.com.br": "Mercado Livre",
+        "www.mercadolivre.com.br": "Mercado Livre",
+        "produto.mercadolivre.com.br": "Mercado Livre",
+        "lista.mercadolivre.com.br": "Mercado Livre",
         "pichau.com.br": "Pichau",
         "www.pichau.com.br": "Pichau",
     }
@@ -254,6 +271,27 @@ async def load_store_history(conn: Any, product_id: str, store: str) -> list[dic
         "ORDER BY observed_at DESC LIMIT 2000",
         product_id, store, BASELINE_DAYS,
     )
+
+
+async def load_cross_store_prices(conn: Any, product_id: str, store: str) -> list[dict[str, Any]]:
+    """Latest comparable observations from other stores for GTIN-linked products."""
+    return await conn.fetch(
+        "SELECT DISTINCT ON (store) store,price,observed_at FROM price_observations "
+        "WHERE product_id=$1 AND store<>$2 AND observed_at>now()-($3 * interval '1 day') "
+        "ORDER BY store,observed_at DESC",
+        product_id, store, BASELINE_DAYS,
+    )
+
+
+def detect_cross_store_anomaly(prices: list[dict[str, Any]], current: float) -> tuple[bool, float]:
+    """Fallback for a newly discovered GTIN: compare against at least two other stores."""
+    if len({row.get("store") for row in prices}) < 2:
+        return False, 0.0
+    center = statistics.median(float(row["price"]) for row in prices)
+    if center <= 0:
+        return False, 0.0
+    drop = (center - current) / center
+    return drop >= MIN_DROP_RATIO, -drop
 
 
 def has_minimum_history_coverage(rows: list[dict[str, Any]], now: datetime | None = None) -> bool:
@@ -342,13 +380,17 @@ async def process_message(client: Redis, message_id: str, fields: dict[str, Any]
     history_key = f"price:history:{obs.product_id}:{obs.store}"
     async with db.acquire() as conn:
         rows = await load_store_history(conn, obs.product_id, obs.store)
+        cross_store_rows = await load_cross_store_prices(conn, obs.product_id, obs.store)
         title = await conn.fetchval("SELECT title FROM tracked_products WHERE product_id=$1", obs.product_id)
     history = [float(row["price"]) for row in rows]
     if has_minimum_history_coverage(rows):
         anomalous, score = detect_anomaly(history, obs.price)
     else:
-        anomalous, score = False, 0.0
-    previous_price = statistics.median(history) if history else None
+        anomalous, score = detect_cross_store_anomaly(cross_store_rows, obs.price)
+    previous_price = statistics.median(history) if history else (
+        statistics.median(float(row["price"]) for row in cross_store_rows)
+        if len({row.get("store") for row in cross_store_rows}) >= 2 else None
+    )
     confirmed = False
     item = {
         **obs.model_dump(mode="json", exclude={"source_url"}),

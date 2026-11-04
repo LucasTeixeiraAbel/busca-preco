@@ -1,6 +1,12 @@
 type OfferCardProps = { title: string; store: string; price: number; previousPrice?: number; anomaly?: boolean; href: string };
 
-const approvedHosts = new Set(["amazon.com.br", "www.amazon.com.br", "kabum.com.br", "www.kabum.com.br"]);
+const approvedHosts = new Set([
+  "amazon.com.br", "www.amazon.com.br",
+  "kabum.com.br", "www.kabum.com.br",
+  "casasbahia.com.br", "www.casasbahia.com.br",
+  "magazineluiza.com.br", "www.magazineluiza.com.br",
+  "mercadolivre.com.br", "www.mercadolivre.com.br", "produto.mercadolivre.com.br",
+]);
 function approvedUrl(value: string): string | null {
   try {
     const url = new URL(value);
